@@ -35,6 +35,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app as app_module  # noqa: E402
 import database  # noqa: E402
 from detector import GroqSignalError  # noqa: E402
+from labels import LABEL_AI, LABEL_HUMAN, LABEL_UNCERTAIN  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -136,9 +137,9 @@ def test_submit_valid(client, monkeypatch):
     assert 0.0 <= body["ai_likelihood"] <= 1.0
     assert 0.0 <= body["confidence"] <= 1.0
     assert body["status"] == "classified"
-    assert body["label"] == (
-        "Multi-signal result: this text shows strong AI-generation signals."
-    )
+    # Milestone 5: the final transparency label is returned.
+    assert body["label"] == LABEL_AI
+    assert body["transparency_label"] == LABEL_AI
 
     # Both signal blocks reflect the mocked outputs.
     assert body["signals"]["groq"]["ai_score"] == pytest.approx(0.94)
@@ -157,7 +158,7 @@ def test_submit_attribution_human(client, monkeypatch):
     body = resp.get_json()
     assert body["attribution"] == "likely_human"
     assert body["confidence"] > 0.5
-    assert "human-authorship" in body["label"]
+    assert body["label"] == LABEL_HUMAN
 
 
 def test_submit_attribution_uncertain(client, monkeypatch):
@@ -168,7 +169,7 @@ def test_submit_attribution_uncertain(client, monkeypatch):
     )
     body = resp.get_json()
     assert body["attribution"] == "uncertain"
-    assert "cannot confidently determine" in body["label"]
+    assert body["label"] == LABEL_UNCERTAIN
 
 
 def test_submit_defaults_content_type(client, monkeypatch):

@@ -21,6 +21,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import app as app_module  # noqa: E402
 import database  # noqa: E402
 from detector import GroqSignalError  # noqa: E402
+from labels import LABEL_AI, LABEL_HUMAN, LABEL_UNCERTAIN  # noqa: E402
 
 
 @pytest.fixture(autouse=True)
@@ -96,9 +97,9 @@ def test_strong_agreement_high_is_likely_ai(client, monkeypatch):
     _mock_both(monkeypatch, _groq(0.94), _style(0.89))
     body = _submit(client).get_json()
     assert body["attribution"] == "likely_ai"
-    assert body["label"] == (
-        "Multi-signal result: this text shows strong AI-generation signals."
-    )
+    # Milestone 5: label/transparency_label now carry the final exact text.
+    assert body["transparency_label"] == LABEL_AI
+    assert body["label"] == LABEL_AI
     assert body["uncertainty"]["forced"] is False
 
 
@@ -106,18 +107,16 @@ def test_strong_agreement_low_is_likely_human(client, monkeypatch):
     _mock_both(monkeypatch, _groq(0.12), _style(0.18))
     body = _submit(client).get_json()
     assert body["attribution"] == "likely_human"
-    assert body["label"] == (
-        "Multi-signal result: this text shows strong human-authorship signals."
-    )
+    assert body["transparency_label"] == LABEL_HUMAN
+    assert body["label"] == LABEL_HUMAN
 
 
 def test_middle_scores_are_uncertain(client, monkeypatch):
     _mock_both(monkeypatch, _groq(0.60), _style(0.55))
     body = _submit(client).get_json()
     assert body["attribution"] == "uncertain"
-    assert body["label"] == (
-        "Multi-signal result: the system cannot confidently determine attribution."
-    )
+    assert body["transparency_label"] == LABEL_UNCERTAIN
+    assert body["label"] == LABEL_UNCERTAIN
 
 
 def test_signal_disagreement_is_uncertain(client, monkeypatch):
