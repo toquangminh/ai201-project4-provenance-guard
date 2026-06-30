@@ -4,6 +4,15 @@ These tests exercise the Flask API (/health, /submit, /log) and the SQLite
 audit log. The Groq signal is always MOCKED so the suite never consumes a
 real Groq API call. A temporary SQLite database is used so the development
 database is never touched.
+
+NOTE: Milestone 4 integrated the second (stylometric) signal and the
+multi-signal scoring into POST /submit. That intentionally changed the
+response contract (signals/ai_likelihood/uncertainty instead of signal_1)
+and the attribution semantics (the short-text rule now forces "uncertain").
+The validation, security, health, and rate-limit tests below are unchanged
+from Milestone 3. The response-shape/attribution tests were updated to the
+Milestone 4 contract while preserving their original intent; both signals are
+mocked so outcomes stay deterministic.
 """
 
 import os
@@ -51,10 +60,24 @@ def client():
         yield test_client
 
 
-def _mock_signal(monkeypatch, ai_score=0.78, reliability=0.80, flags=None):
-    """Patch run_groq_signal (as imported into app) to return a fixed dict."""
+def _mock_signal(
+    monkeypatch,
+    ai_score=0.78,
+    reliability=0.80,
+    flags=None,
+    style_score=None,
+    style_reliability=1.0,
+    word_count=200,
+):
+    """Patch BOTH signal functions (as imported into app) to fixed dicts.
+
+    Mocking stylometry too keeps the integrated /submit outcome deterministic.
+    style_score defaults to ai_score so the two signals agree by default.
+    """
     if flags is None:
         flags = []
+    if style_score is None:
+        style_score = ai_score
 
     def fake_run_groq_signal(text, content_type="other"):
         return {
@@ -64,7 +87,19 @@ def _mock_signal(monkeypatch, ai_score=0.78, reliability=0.80, flags=None):
             "signal": "groq",
         }
 
+    def fake_run_stylometric_signal(text, content_type="other"):
+        return {
+            "ai_score": style_score,
+            "reliability": style_reliability,
+            "features": {"word_count": word_count, "sentence_count": 10},
+            "component_scores": {"sentence_uniformity": style_score},
+            "signal": "stylometry",
+        }
+
     monkeypatch.setattr(app_module, "run_groq_signal", fake_run_groq_signal)
+    monkeypatch.setattr(
+        app_module, "run_stylometric_signal", fake_run_stylometric_signal
+    )
 
 
 # --------------------------------------------------------------------------
@@ -80,7 +115,11 @@ def test_health(client):
 # /submit — happy path
 # --------------------------------------------------------------------------
 def test_submit_valid(client, monkeypatch):
-    _mock_signal(monkeypatch, ai_score=0.78, reliability=0.80, flags=["generic transitions"])
+    # Both signals agree high -> likely_ai under the Milestone 4 contract.
+    _mock_signal(
+        monkeypatch, ai_score=0.94, reliability=1.0, flags=["generic transitions"],
+        style_score=0.89,
+    )
     resp = client.post(
         "/submit",
         json={
@@ -92,43 +131,44 @@ def test_submit_valid(client, monkeypatch):
     assert resp.status_code == 200
     body = resp.get_json()
 
-    # Attribution / confidence / status / label all present and correct.
+    # Attribution / likelihood / confidence / status / label present & correct.
     assert body["attribution"] == "likely_ai"
-    assert body["confidence"] == pytest.approx(0.78)
+    assert 0.0 <= body["ai_likelihood"] <= 1.0
+    assert 0.0 <= body["confidence"] <= 1.0
     assert body["status"] == "classified"
     assert body["label"] == (
-        "Preliminary result: the first detection signal leans toward AI-generated."
+        "Multi-signal result: this text shows strong AI-generation signals."
     )
 
-    # Signal 1 block reflects the mocked Groq output.
-    assert body["signal_1"]["name"] == "groq"
-    assert body["signal_1"]["ai_score"] == pytest.approx(0.78)
-    assert body["signal_1"]["reliability"] == pytest.approx(0.80)
-    assert body["signal_1"]["flags"] == ["generic transitions"]
+    # Both signal blocks reflect the mocked outputs.
+    assert body["signals"]["groq"]["ai_score"] == pytest.approx(0.94)
+    assert body["signals"]["groq"]["flags"] == ["generic transitions"]
+    assert body["signals"]["stylometry"]["ai_score"] == pytest.approx(0.89)
+    assert body["signals"]["signal_gap"] == pytest.approx(0.05)
+    assert body["uncertainty"]["forced"] is False
 
 
 def test_submit_attribution_human(client, monkeypatch):
-    _mock_signal(monkeypatch, ai_score=0.15)
+    _mock_signal(monkeypatch, ai_score=0.15, style_score=0.18)
     resp = client.post(
         "/submit",
         json={"text": "A personal, specific story about my grandmother.", "creator_id": "u"},
     )
     body = resp.get_json()
     assert body["attribution"] == "likely_human"
-    assert body["confidence"] == pytest.approx(0.85)
-    assert "human-written" in body["label"]
+    assert body["confidence"] > 0.5
+    assert "human-authorship" in body["label"]
 
 
 def test_submit_attribution_uncertain(client, monkeypatch):
-    _mock_signal(monkeypatch, ai_score=0.50)
+    _mock_signal(monkeypatch, ai_score=0.50, style_score=0.50)
     resp = client.post(
         "/submit",
         json={"text": "Some ambiguous middling text here.", "creator_id": "u"},
     )
     body = resp.get_json()
     assert body["attribution"] == "uncertain"
-    assert body["confidence"] == pytest.approx(0.50)
-    assert "uncertain" in body["label"]
+    assert "cannot confidently determine" in body["label"]
 
 
 def test_submit_defaults_content_type(client, monkeypatch):
@@ -179,13 +219,19 @@ def test_submit_text_too_long(client):
 
 
 # --------------------------------------------------------------------------
-# /submit — Groq failure
+# /submit — total detection failure
 # --------------------------------------------------------------------------
-def test_submit_groq_failure_returns_503(client, monkeypatch):
-    def boom(text, content_type="other"):
+def test_submit_both_signals_fail_returns_503(client, monkeypatch):
+    # Under Milestone 4, 503 requires BOTH signals to fail. (A single-signal
+    # failure now degrades gracefully to an "uncertain" 200 response.)
+    def boom_groq(text, content_type="other"):
         raise GroqSignalError("simulated groq outage")
 
-    monkeypatch.setattr(app_module, "run_groq_signal", boom)
+    def boom_style(text, content_type="other"):
+        raise ValueError("simulated stylometry failure")
+
+    monkeypatch.setattr(app_module, "run_groq_signal", boom_groq)
+    monkeypatch.setattr(app_module, "run_stylometric_signal", boom_style)
     resp = client.post(
         "/submit",
         json={"text": "some creative text", "creator_id": "u"},
@@ -197,19 +243,23 @@ def test_submit_groq_failure_returns_503(client, monkeypatch):
     # No fabricated attribution/score is returned on failure.
     assert "attribution" not in body
 
-    # A detection_error audit entry was written.
+    # A detection_error audit entry was written, with no signal scores.
     entries = database.get_log()
     assert any(e["status"] == "detection_error" for e in entries)
     err_entry = next(e for e in entries if e["status"] == "detection_error")
     assert err_entry["attribution"] is None
-    assert err_entry["llm_score"] is None
+    assert err_entry["groq_ai_score"] is None
+    assert err_entry["stylometric_ai_score"] is None
 
 
 # --------------------------------------------------------------------------
 # Audit log
 # --------------------------------------------------------------------------
 def test_submit_creates_audit_entry(client, monkeypatch):
-    _mock_signal(monkeypatch, ai_score=0.9, reliability=0.7, flags=["templated"])
+    _mock_signal(
+        monkeypatch, ai_score=0.9, reliability=0.7, flags=["templated"],
+        style_score=0.88,
+    )
     resp = client.post(
         "/submit",
         json={"text": "uniform polished text", "creator_id": "creator-x", "content_type": "blog_post"},
@@ -224,17 +274,20 @@ def test_submit_creates_audit_entry(client, monkeypatch):
     assert entry["content_type"] == "blog_post"
     assert entry["status"] == "classified"
     assert entry["attribution"] == "likely_ai"
-    assert entry["llm_score"] == pytest.approx(0.9)
-    assert entry["llm_reliability"] == pytest.approx(0.7)
-    # signal_flags is decoded from JSON back into a list.
-    assert entry["signal_flags"] == ["templated"]
+    # Both signal scores and the combined score are recorded.
+    assert entry["groq_ai_score"] == pytest.approx(0.9)
+    assert entry["groq_reliability"] == pytest.approx(0.7)
+    assert entry["stylometric_ai_score"] == pytest.approx(0.88)
+    assert entry["combined_ai_score"] is not None
+    # groq_flags is decoded from JSON back into a list.
+    assert entry["groq_flags"] == ["templated"]
     # Raw text is never stored; a content hash is.
     assert entry["content_hash"] and len(entry["content_hash"]) == 64
     assert "uniform polished text" not in str(entry)
 
 
 def test_log_returns_structured_entries_newest_first(client, monkeypatch):
-    _mock_signal(monkeypatch, ai_score=0.8)
+    _mock_signal(monkeypatch, ai_score=0.8, style_score=0.8)
     client.post("/submit", json={"text": "first submission text", "creator_id": "a"})
     client.post("/submit", json={"text": "second submission text", "creator_id": "b"})
 
@@ -247,9 +300,11 @@ def test_log_returns_structured_entries_newest_first(client, monkeypatch):
     assert entries[1]["creator_id"] == "a"
     # Each entry is structured with the expected keys.
     for entry in entries:
-        for key in ("content_id", "timestamp", "content_hash", "status", "signal_flags"):
+        for key in ("content_id", "timestamp", "content_hash", "status", "groq_flags"):
             assert key in entry
-        assert isinstance(entry["signal_flags"], list)
+        # JSON columns are decoded back into Python containers.
+        assert isinstance(entry["groq_flags"], list)
+        assert isinstance(entry["uncertainty_reasons"], list)
 
 
 def test_content_id_is_unique(client, monkeypatch):
